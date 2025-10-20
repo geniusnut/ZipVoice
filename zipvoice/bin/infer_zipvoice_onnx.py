@@ -579,16 +579,27 @@ def generate_sentence(
             factor metrics for processing.
     """
 
-    # Load and process prompt wav
-    prompt_wav = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
+    # Track timing for each step
+    step_times = {}
+    total_start_t = dt.datetime.now()
 
-    # Remove edge and long silences in the prompt wav.
+    # Step 1: Load and process prompt wav
+    step_start = dt.datetime.now()
+    prompt_wav = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
+    step_times["load_prompt_wav"] = (dt.datetime.now() - step_start).total_seconds()
+
+    # Step 2: Remove edge and long silences in the prompt wav.
     # Add 0.2s trailing silence to avoid leaking prompt to generated speech.
+    step_start = dt.datetime.now()
     prompt_wav = remove_silence(
         prompt_wav, sampling_rate, only_edge=False, trail_sil=200
     )
+    step_times["remove_silence"] = (dt.datetime.now() - step_start).total_seconds()
 
+    # Step 3: RMS normalization
+    step_start = dt.datetime.now()
     prompt_wav, prompt_rms = rms_norm(prompt_wav, target_rms)
+    step_times["rms_norm"] = (dt.datetime.now() - step_start).total_seconds()
 
     prompt_duration = prompt_wav.shape[-1] / sampling_rate
 
@@ -603,36 +614,45 @@ def generate_sentence(
             f"It will lead to slower inference speed and possibly worse speech quality."
         )
 
-    # Extract features from prompt wav
+    # Step 4: Extract features from prompt wav
+    step_start = dt.datetime.now()
     prompt_features = feature_extractor.extract(prompt_wav, sampling_rate=sampling_rate)
 
     prompt_features = prompt_features.unsqueeze(0) * feat_scale
+    step_times["feature_extraction"] = (dt.datetime.now() - step_start).total_seconds()
 
-    # Add punctuation in the end if there is not
+    # Step 5: Add punctuation and tokenization
+    step_start = dt.datetime.now()
     text = add_punctuation(text)
     prompt_text = add_punctuation(prompt_text)
 
     # Tokenize text (str tokens), punctuations will be preserved.
     tokens_str = tokenizer.texts_to_tokens([text])[0]
     prompt_tokens_str = tokenizer.texts_to_tokens([prompt_text])[0]
+    step_times["tokenization"] = (dt.datetime.now() - step_start).total_seconds()
 
-    # chunk text so that each len(prompt wav + generated wav) is around 25 seconds.
+    # Step 6: Chunk text
+    step_start = dt.datetime.now()
     token_duration = (prompt_wav.shape[-1] / sampling_rate) / (
         len(prompt_tokens_str) * speed
     )
     max_tokens = int((25 - prompt_duration) / token_duration)
     chunked_tokens_str = chunk_tokens_punctuation(tokens_str, max_tokens=max_tokens)
-    print(len(chunked_tokens_str))
-    print(chunked_tokens_str)
+    print(f"Number of chunks: {len(chunked_tokens_str)}")
+    print(f"Chunked tokens: {chunked_tokens_str}")
 
     # Tokenize text (int tokens)
     chunked_tokens = tokenizer.tokens_to_token_ids(chunked_tokens_str)
     prompt_tokens = tokenizer.tokens_to_token_ids([prompt_tokens_str])
+    step_times["text_chunking"] = (dt.datetime.now() - step_start).total_seconds()
 
-    # Start predicting features
+    # Step 7: Generate features for each chunk
+    step_start = dt.datetime.now()
     chunked_features = []
-    start_t = dt.datetime.now()
-    for tokens in chunked_tokens:
+    chunk_generation_times = []
+
+    for chunk_idx, tokens in enumerate(chunked_tokens):
+        chunk_start = dt.datetime.now()
 
         # Generate features
         pred_features = sample(
@@ -650,43 +670,98 @@ def generate_sentence(
         pred_features = pred_features.permute(0, 2, 1) / feat_scale  # (B, C, T)
         chunked_features.append(pred_features)
 
-    # Start vocoder processing
-    chunked_wavs = []
-    start_vocoder_t = dt.datetime.now()
+        chunk_time = (dt.datetime.now() - chunk_start).total_seconds()
+        chunk_generation_times.append(chunk_time)
+        logging.info(
+            f"Chunk {chunk_idx + 1}/{len(chunked_tokens)} generation time: {chunk_time:.4f}s"
+        )
 
-    for pred_features in chunked_features:
+    step_times["feature_generation"] = (dt.datetime.now() - step_start).total_seconds()
+    step_times["feature_generation_per_chunk"] = chunk_generation_times
+
+    # Step 8: Vocoder processing
+    step_start = dt.datetime.now()
+    chunked_wavs = []
+    chunk_vocoder_times = []
+
+    for chunk_idx, pred_features in enumerate(chunked_features):
+        chunk_start = dt.datetime.now()
+
         wav = vocoder.decode(pred_features).squeeze(1).clamp(-1, 1)
         # Adjust wav volume if necessary
         if prompt_rms < target_rms:
             wav = wav * prompt_rms / target_rms
         chunked_wavs.append(wav)
 
-    # Finish model generation
-    t = (dt.datetime.now() - start_t).total_seconds()
+        chunk_time = (dt.datetime.now() - chunk_start).total_seconds()
+        chunk_vocoder_times.append(chunk_time)
+        logging.info(
+            f"Chunk {chunk_idx + 1}/{len(chunked_features)} vocoder time: {chunk_time:.4f}s"
+        )
 
-    # Merge chunked wavs
+    step_times["vocoder_processing"] = (dt.datetime.now() - step_start).total_seconds()
+    step_times["vocoder_processing_per_chunk"] = chunk_vocoder_times
+
+    # Step 9: Merge chunked wavs
+    step_start = dt.datetime.now()
     final_wav = cross_fade_concat(
         chunked_wavs, fade_duration=0.1, sample_rate=sampling_rate
     )
+    step_times["wav_merging"] = (dt.datetime.now() - step_start).total_seconds()
+
+    # Step 10: Remove silence from final wav
+    step_start = dt.datetime.now()
     final_wav = remove_silence(
         final_wav, sampling_rate, only_edge=(not remove_long_sil), trail_sil=0
     )
+    step_times["final_silence_removal"] = (
+        dt.datetime.now() - step_start
+    ).total_seconds()
 
-    # Calculate processing time metrics
-    t_no_vocoder = (start_vocoder_t - start_t).total_seconds()
-    t_vocoder = (dt.datetime.now() - start_vocoder_t).total_seconds()
+    # Calculate overall processing time metrics
+    t_total = (dt.datetime.now() - total_start_t).total_seconds()
+    t_no_vocoder = step_times["feature_generation"]
+    t_vocoder = step_times["vocoder_processing"]
     wav_seconds = final_wav.shape[-1] / sampling_rate
-    rtf = t / wav_seconds
+    rtf = t_total / wav_seconds
     rtf_no_vocoder = t_no_vocoder / wav_seconds
     rtf_vocoder = t_vocoder / wav_seconds
+
+    # Log detailed timing breakdown
+    logging.info("=" * 60)
+    logging.info("Timing Breakdown:")
+    logging.info(f"  1. Load prompt wav:          {step_times['load_prompt_wav']:.4f}s")
+    logging.info(f"  2. Remove silence:           {step_times['remove_silence']:.4f}s")
+    logging.info(f"  3. RMS normalization:        {step_times['rms_norm']:.4f}s")
+    logging.info(
+        f"  4. Feature extraction:       {step_times['feature_extraction']:.4f}s"
+    )
+    logging.info(f"  5. Tokenization:             {step_times['tokenization']:.4f}s")
+    logging.info(f"  6. Text chunking:            {step_times['text_chunking']:.4f}s")
+    logging.info(
+        f"  7. Feature generation:       {step_times['feature_generation']:.4f}s"
+    )
+    logging.info(
+        f"  8. Vocoder processing:       {step_times['vocoder_processing']:.4f}s"
+    )
+    logging.info(f"  9. Wav merging:              {step_times['wav_merging']:.4f}s")
+    logging.info(
+        f" 10. Final silence removal:   {step_times['final_silence_removal']:.4f}s"
+    )
+    logging.info(
+        f"Total time: {t_total:.4f}s | Generated audio: {wav_seconds:.2f}s | RTF: {rtf:.4f}"
+    )
+    logging.info("=" * 60)
+
     metrics = {
-        "t": t,
+        "t": t_total,
         "t_no_vocoder": t_no_vocoder,
         "t_vocoder": t_vocoder,
         "wav_seconds": wav_seconds,
         "rtf": rtf,
         "rtf_no_vocoder": rtf_no_vocoder,
         "rtf_vocoder": rtf_vocoder,
+        "step_times": step_times,
     }
 
     torchaudio.save(save_path, final_wav.cpu(), sample_rate=sampling_rate)
