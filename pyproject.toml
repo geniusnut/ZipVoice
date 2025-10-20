@@ -24,5 +24,18 @@ dependencies = [
     "pypinyin==0.55.0",
 ]
 
+[[tool.uv.index]]
+name = "k2-cuda"
+url = "https://k2-fsa.github.io/k2/cuda.html"
+format = "flat"
+explicit = true
+
+[[tool.uv.index]]
+name = "piper-phonemize"
+url = "https://k2-fsa.github.io/icefall/piper_phonemize.html"
+format = "flat"
+explicit = true
+
 [tool.uv.sources]
-piper_phonemize = { index = "https://k2-fsa.github.io/icefall/piper_phonemize.html" }
+k2 = { index = "k2-cuda" }
+piper_phonemize = { index = "piper-phonemize" }
